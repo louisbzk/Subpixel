@@ -5,7 +5,8 @@ author: Lionel Moisan
 
 v0.1 (13/10/2022): initial version (View, fftzoom)
 v0.2 (20/10/2022): added perdecomp, fshift, randphase, normsat
-v0.3 (27/10/2022): added fsym2
+v0.3 (27/10/2022): added fsym2, ffttrans, fftshear
+v0.4 (17/11/2022): added fzoom, frot (and other functions related to spline interpolation)
 
 available functions/classes:
 
@@ -15,6 +16,11 @@ v = fftzoom(image, zoom): image zooming (Shannon interpolation)
 p,s = perdecomp(u): periodic + smooth decomposition
 v = randphase(u): phase randomization
 v = normsat(u, saturation): image renormalization (0<=saturation<=100)
+v = fsym2(u): symmetrize an image along each coordinate
+v = ffttrans(u, tx, ty): image translation using Shannon interpolation
+v = fftshear(u, a, v, axis): shear transformation of an image using Shannon interpolation
+v = fzoom(u, z, order): image zoom using spline or bicubic Keys interpolation
+v = frot(u, theta, order, x0, y0): image roration using spline or bicubic Keys interpolation
 """
 
 from matplotlib import image
@@ -295,4 +301,200 @@ def fftshear(u, a, b, axis=1):
     return v
               
 
+# coefficients of piecewise polynomial bicubic Keys function
+def mat_coeff_keys(a):
+    return np.array([[0,0,a,-a], [0,-a,2*a+3,-(a+2)], [1,0,-a-3,a+2], [0,a,-2*a,a]])
+
+from math import factorial, comb
+
+# coefficients of piecewise polynomial spline function with order n
+def mat_coeff_splinen(n):
+    c = np.zeros((n+1,n+1))
+    a = [0]*(n+2)
+    a[0] = 1/factorial(n)
+    for k in range(1, n+2):
+        a[k] = -a[k-1]*(n+2-k)/k
+    for k in range(n+2):
+        for p in range(n+1):
+            xp = comb(n,p)*k**(n-p)
+            for i in range(k, n+1):
+                c[i,p] += a[i-k]*xp
+    return c
+
+# 1D inverse z-Transform (on all lines) with poles z
+def invspline1D(c, z):
+    npoles = len(z)
+    N = c.shape[1]
+    # normalization
+    c *= np.prod([(1-x)*(1-1/x) for x in z])
+    for k in range(npoles): # loop on poles
+        # initialize causal filter, symmetric boundary conditions
+        c[:,0] = np.hstack((1., z[k]**np.arange(1,N-1) + z[k]**np.arange(2*N-3,N-1,-1), z[k]**(N-1))) @ c.T / (1-z[k]**(2*N-1))
+        for n in range(1,N): #forward recursion 
+            c[:,n] += z[k]*c[:,n-1]
+        # initialize anticausal filter, symmetric boundary conditions
+        c[:,N-1] = (z[k]/(z[k]**2-1)) * (z[k]*c[:,N-2] + c[:,N-1])
+        for n in range(N-2,-1,-1): # backwards recursion 
+            c[:,n] = z[k]*(c[:,n+1]-c[:,n]);
+    return c
+
+# 2D inverse B-spline transform
+def finvspline(c,order):
+    # initialize poles of associated z-filter 
+    if order==2:
+        z = [-0.17157288]  # sqrt(8)-3 
+    elif order==3: 
+        z = [-0.26794919]  # sqrt(3)-2 
+    elif order==4: 
+        z = [-0.361341,-0.0137254]
+    elif order==5:
+        z = [-0.430575,-0.0430963]
+    elif order==6:
+        z = [-0.488295,-0.0816793,-0.00141415]
+    elif order==7:
+        z = [-0.53528,-0.122555,-0.00914869]
+    elif order==8:
+        z = [-0.574687,-0.163035,-0.0236323,-0.000153821]
+    elif order==9:
+        z = [-0.607997,-0.201751,-0.0432226,-0.00212131]
+    elif order==10: 
+        z = [-0.636551,-0.238183,-0.065727,-0.00752819,-0.0000169828]
+    elif order==11:
+        z = [-0.661266,-0.27218,-0.0897596,-0.0166696,-0.000510558]
+    else:
+        raise NameError('finvspline: order should be in 2..11.')
+    return invspline1D(invspline1D(c, z).T, z).T
+
+
+def fzoom(u, z=2, order=0):
+    """
+    Zoom an image by a factor z 
+
+    z is not necessarily an integer (default value: 2)
+    available interpolations are:
+       order = 0           nearest neighbor (default)
+       order = 1           bilinear
+       order = -3          bicubic Keys
+       order = 3,5,7,9,11  spline with specified order
+    """
+    u = u.astype('double')
+    ny, nx = u.shape
+    sx = int(nx*z)
+    sy = int(ny*z)
+    if order==0:
+        # nearest neighbor is a special case (symmetric interpolation grid)
+        X = (nx-1-(sx-1)/z)/2 + np.arange(sx)/z
+        Y = (ny-1-(sy-1)/z)/2 + np.arange(sy)/z
+        iX = sx - np.floor(sx-X+0.5).astype(int)
+        iY = sy - np.floor(sy-Y+0.5).astype(int)
+        v = u[np.ix_(iY,iX)]
+    else:
+        X = np.arange(sx)/z;
+        Y = np.arange(sy)/z
+        iX = np.floor(X).astype(int)
+        iY = np.floor(Y).astype(int)
+        X -= iX
+        Y -= iY
+        if order==-3: # bicubic Keys interpolation
+            n2 = 2
+            c = mat_coeff_keys(-1/2)
+            order = 3
+        elif order in {1,3,5,7,9,11}: # spline interpolation
+            n2 = (order+1)//2
+            c = mat_coeff_splinen(order)
+            if order>1: 
+                u = finvspline(u, order)
+        else:
+            raise NameError('fzoom: Unrecognized interpolation order.')
+        n1 = 1-n2
+        # compute interpolation coefficients
+        cx = c @ ( X**np.vstack(np.arange(order+1)) )
+        cy = c @ ( Y**np.vstack(np.arange(order+1)) )        
+        # add (symmetrical) borders to avoid undefined coordinates
+        u = np.hstack((u[:, -n1:0:-1], u, u[:, -2:-n2-2:-1]))
+        u = np.vstack((u[-n1:0:-1, :], u, u[-2:-n2-2:-1, :]))    
+        # interpolation
+        v = np.zeros((sy,sx))
+        for dx in range(n1,n2+1):
+            for dy in range(n1,n2+1):
+                v += np.vstack(cy[n2-dy,:]) * cx[n2-dx,:] * u[np.ix_(iY+dy-n1-1,iX+dx-n1-1)]
+    return v
+
+def frot(u, theta, order=1, x0=None, y0=None):
+    """ 
+    Rotate an image 
+    
+    The output image v is defined by
+    v(y,x) = U(Y,X)  where U is the specified interpolate of u and
+    
+    X = x0 + cos(theta)*(x-x0) - sin(theta)*(y-y0)
+    Y = y0 + sin(theta)*(x-x0) + cos(theta)*(y-y0)
+    
+    by default (if x0 and y0 are not both specified) the rotation center is
+    the image center: (x0,y0) = ( (nx+1)/2, (ny+1)/2 )
+    
+    The rotation angle (theta) is counted counterclockwise, in degrees
+    
+    available interpolations are:
+     order = 0           nearest neighbor (default)
+     order = 1           bilinear
+     order = -3          bicubic Keys
+     order = 3,5,7,9,11  spline with specified order
+    """
+    u = u.astype('double')
+    ny, nx = u.shape
+    if x0 is None:
+        x0 = (nx-1)/2
+    if y0 is None:
+        y0 = (ny-1)/2
+    x, y = np.meshgrid(range(nx), range(ny))
+    co = np.cos(theta*np.pi/180)
+    si = np.sin(theta*np.pi/180)    
+    X = x0 + co*(x-x0) - si*(y-y0)
+    Y = y0 + si*(x-x0) + co*(y-y0)
+    if order==0: # nearest neighbor interpolation
+        iX = np.floor(X+0.5).astype(int)
+        iY = np.floor(Y+0.5).astype(int)
+        n1, n2 = 0, 0
+    else: # other interpolations
+        iX = np.floor(X).astype(int)
+        iY = np.floor(Y).astype(int)
+        X -= iX
+        Y -= iY
+        if order==-3: # bicubic Keys interpolation
+            n2 = 2
+            c = mat_coeff_keys(-1/2)
+            order = 3
+        elif order in {1,3,5,7,9,11}: # spline interpolation
+            n2 = (order+1)//2
+            c = mat_coeff_splinen(order)
+            if order>1:
+                u = finvspline(u, order) 
+        else:
+            raise NameError("Unrecognized interpolation order.")
+        n1 = 1-n2
+    # add (symmetrical) borders to avoid undefined coordinates
+    iX = iX.flatten()
+    iY = iY.flatten()
+    supx1 = max(0, -min(iX)) - n1
+    supx2 = max(0, max(iX)-nx+1) + n2
+    u = np.hstack((u[:,supx1:0:-1], u, u[:,nx-2:nx-2-supx2:-1]))
+    iX = iX + supx1
+    supy1 = max(0, -min(iY)) - n1
+    supy2 = max(0, max(iY)-ny+1) + n2
+    u = np.vstack((u[supy1:0:-1,:], u, u[ny-2:ny-2-supy2:-1,:]))
+    iY = iY + supy1
+    if order==0: # nearest neighbor interpolation
+        v = np.reshape(u.flatten()[iX+iY*u.shape[1]], (ny,nx))
+    else: # other interpolations 
+        # compute interpolation coefficients
+        cx = c @ ( X.flatten()**np.vstack(np.arange(order+1)) )
+        cy = c @ ( Y.flatten()**np.vstack(np.arange(order+1)) )        
+        # interpolation
+        v = np.zeros(nx*ny)
+        for dx in range(n1, n2+1):
+            for dy in range(n1, n2+1):
+                v += cy[n2-dy,:] * cx[n2-dx,:] * u.flatten()[iX+dx-n1-1+(iY+dy-n1-1)*u.shape[1]]
+        v = np.reshape(v, (ny,nx))
+    return v
 
